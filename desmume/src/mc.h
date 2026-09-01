@@ -152,6 +152,7 @@ public:
 	bool export_no_gba(const char* fname);
 	bool export_raw(const char* filename);
 	bool no_gba_unpack(u8 *&buf, u32 &size);
+	bool copyRawData(std::vector<u8> &data);
 	
 	bool load_movie(EMUFILE *is);
 	void load_movie_blank();

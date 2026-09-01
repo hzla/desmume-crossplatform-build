@@ -156,6 +156,26 @@ bool BackupDevice::save_state(EMUFILE &os)
 	return true;
 }
 
+bool BackupDevice::copyRawData(std::vector<u8> &data)
+{
+	data.clear();
+	if (this->_fpMC == NULL || this->_fsize == 0)
+		return false;
+
+	const int savePos = this->_fpMC->ftell();
+	data.resize(this->_fsize);
+	this->_fpMC->fseek(0, SEEK_SET);
+	const size_t bytesRead = this->_fpMC->fread(&data[0], this->_fsize);
+	this->_fpMC->fseek(savePos, SEEK_SET);
+	if (bytesRead != this->_fsize)
+	{
+		data.clear();
+		return false;
+	}
+
+	return true;
+}
+
 bool BackupDevice::load_state(EMUFILE &is)
 {
 	u32 version;

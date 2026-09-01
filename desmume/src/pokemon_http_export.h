@@ -450,7 +450,10 @@ void Shutdown();
 #include "pokemon_gen4_data.generated.h"
 #include "pokemon_gen4_hgss_locations.generated.h"
 #include "pokemon_gen4_hgss_rng_move_names.generated.h"
+#include "pokemon_gen4_platinum_kaizo_data.generated.h"
+#include "pokemon_gen4_sterling_silver_data.generated.h"
 #include "pokemon_gen5_data.generated.h"
+#include "pokemon_gen5_bb2_vw2_redux_data.generated.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -486,7 +489,9 @@ static const size_t kPartySlotsPerBox = 30;
 static const size_t kGen4TotalBoxCount = 18;
 static const size_t kGen4LiveExportBoxCount = 13;
 static const size_t kHgssExportBoxCount = 18;
+static const size_t kBwLiveExportBoxCount = 7;
 static const size_t kBwExportBoxCount = 24;
+static const uint32_t kBwBrutalBlackRuntimeRootDelta = 0x40u;
 static const int kDecryptRetryCount = 5;
 static const int kPartyWriteReadRetryCount = 30;
 static const int kPartyWriteReadRetryDelayMs = 16;
@@ -554,6 +559,7 @@ static const uint32_t kBwBattlePokeParamCurHpOffset = 0x10u;
 static const uint32_t kBwBattlePokePartyFirstMonOffset = 0x08u;
 static const uint32_t kBwBattleNearbyMainScanRadius = 0x40u;
 static const uint32_t kBw2BattleMainModuleOffsetFromBattleWorkRoot = 0xF944u;
+static const uint32_t kBw2RuntimePartyRootScanRadius = 0x40000u;
 static const uint32_t kArm9MainRamStart = 0x02000000u;
 static const uint32_t kArm9MainRamEnd = 0x02400000u;
 
@@ -607,6 +613,10 @@ static const char *GetRenegadePlatinumMoveNameOverride(uint16_t moveId);
 static const char *GetBb2Vw2ReduxMoveNameOverride(uint16_t moveId);
 static int GetLevelForExperienceGen4(uint32_t experience, int speciesId);
 static uint32_t GetExperienceForLevelGen4(int level, int speciesId);
+static int GetLevelForExperiencePlatinumKaizo(uint32_t experience, int speciesId);
+static uint32_t GetExperienceForLevelPlatinumKaizo(int level, int speciesId);
+static int GetLevelForExperienceSterlingSilver(uint32_t experience, int speciesId);
+static uint32_t GetExperienceForLevelSterlingSilver(int level, int speciesId);
 static uint8_t GetMoveBasePpGen4(uint16_t moveId);
 static bool LookupMoveIdByNameGen4(const std::string &name, uint16_t &moveId, std::string &canonicalName);
 struct ExportProfileDefinition;
@@ -620,6 +630,8 @@ static const char *GetHgssLocationNameAdapter(uint16_t locationId);
 static const char *GetGen5FormSuffixAdapter(uint16_t speciesId, uint8_t formIndex);
 static int GetLevelForExperienceGen5(uint32_t experience, int speciesId);
 static uint32_t GetExperienceForLevelGen5(int level, int speciesId);
+static int GetLevelForExperienceBb2Vw2Redux(uint32_t experience, int speciesId);
+static uint32_t GetExperienceForLevelBb2Vw2Redux(int level, int speciesId);
 static bool LookupMoveIdByNameGen5(const std::string &name, uint16_t &moveId, std::string &canonicalName);
 
 static const GameTextTables kGen4TextTables = {
@@ -719,6 +731,20 @@ static const PokemonMechanics kGen4Mechanics = {
 	LookupMoveIdByNameGen4
 };
 
+static const PokemonMechanics kPlatinumKaizoMechanics = {
+	GetLevelForExperiencePlatinumKaizo,
+	GetExperienceForLevelPlatinumKaizo,
+	GetMoveBasePpGen4,
+	LookupMoveIdByNameGen4
+};
+
+static const PokemonMechanics kSterlingSilverMechanics = {
+	GetLevelForExperienceSterlingSilver,
+	GetExperienceForLevelSterlingSilver,
+	GetMoveBasePpGen4,
+	LookupMoveIdByNameGen4
+};
+
 static const GameTextTables kGen5BwTextTables = {
 	desmume_pokemon_gen5::kSpeciesNames,
 	desmume_pokemon_gen5::kSpeciesNamesCount,
@@ -776,6 +802,13 @@ static const GameTextTables kBb2Vw2ReduxTextTables = {
 static const PokemonMechanics kGen5Mechanics = {
 	GetLevelForExperienceGen5,
 	GetExperienceForLevelGen5,
+	GetMoveBasePpGen4,
+	LookupMoveIdByNameGen5
+};
+
+static const PokemonMechanics kBb2Vw2ReduxMechanics = {
+	GetLevelForExperienceBb2Vw2Redux,
+	GetExperienceForLevelBb2Vw2Redux,
 	GetMoveBasePpGen4,
 	LookupMoveIdByNameGen5
 };
@@ -1133,6 +1166,7 @@ static std::string GameCodeString();
 static const ExportProfileDefinition *GetExportProfileDefinition(ExportGameProfile profile);
 static uint32_t AdvanceLcrng(uint32_t seed);
 static uint8_t ReadArm9U8(uint32_t address);
+static uint16_t ReadArm9U16(uint32_t address);
 static uint32_t ReadArm9U32(uint32_t address);
 static const char *LookupOneBasedName(const char *const *names, size_t count, int id);
 static bool IsHgssLikeProfile(ExportGameProfile profile);
@@ -1201,6 +1235,148 @@ static bool IsGen4LikeProfile(ExportGameProfile profile)
 	return IsPlatinumLikeProfile(profile) || IsHgssLikeProfile(profile);
 }
 
+static bool IsPlausibleBwPartyRuntimeRoot(uint32_t partyCountAddr, uint32_t partyAddr)
+{
+	// In BW, partyAddr points to member[0]. The two preceding words are
+	// PokeCountMax and PokeCount, respectively.
+	if ((partyAddr < (kArm9MainRamStart + 0x8u)) ||
+	    (partyAddr > (kArm9MainRamEnd - static_cast<uint32_t>(kGen5PartyMonSize))) ||
+	    (partyCountAddr != (partyAddr - 0x4u))) {
+		return false;
+	}
+
+	return (ReadArm9U32(partyAddr - 0x8u) == 6u) &&
+	       (ReadArm9U32(partyCountAddr) <= 6u);
+}
+
+static bool IsValidGen5StoredPartyPokemon(uint32_t monAddr)
+{
+	if (monAddr < kArm9MainRamStart ||
+	    monAddr > (kArm9MainRamEnd - static_cast<uint32_t>(kGen5PartyMonSize))) {
+		return false;
+	}
+
+	const uint32_t pid = ReadArm9U32(monAddr);
+	const uint16_t sanityFlags = ReadArm9U16(monAddr + 0x4u);
+	const uint16_t expectedChecksum = ReadArm9U16(monAddr + 0x6u);
+	const bool alreadyDecrypted = (sanityFlags & (1u << 1)) != 0u;
+	const int shuffleKey = static_cast<int>(((pid & 0x3E000u) >> 13) % 24u);
+	const uint32_t blockAOffset = static_cast<uint32_t>(kShuffleTable[shuffleKey][0]);
+
+	uint32_t seed = expectedChecksum;
+	uint32_t checksum = 0u;
+	uint16_t species = 0u;
+	for (uint32_t offset = 0x8u; offset < (0x8u + kGen5CoreBytes); offset += 2u) {
+		uint16_t word = ReadArm9U16(monAddr + offset);
+		if (!alreadyDecrypted) {
+			seed = AdvanceLcrng(seed);
+			word = static_cast<uint16_t>(word ^ (seed >> 16));
+		}
+		checksum = (checksum + word) & 0xFFFFu;
+		if (offset == blockAOffset) {
+			species = word;
+		}
+	}
+
+	return checksum == expectedChecksum && species != 0u && species <= 1023u;
+}
+
+static bool IsValidatedBw2PartyRuntimeRoot(uint32_t partyAddr, bool allowEmptyParty)
+{
+	if (!IsPlausibleBwPartyRuntimeRoot(partyAddr - 0x4u, partyAddr)) {
+		return false;
+	}
+
+	const uint32_t partyCount = ReadArm9U32(partyAddr - 0x4u);
+	if (partyCount == 0u) {
+		return allowEmptyParty;
+	}
+
+	for (uint32_t slot = 0u; slot < partyCount; ++slot) {
+		const uint32_t monAddr = partyAddr
+			+ slot * static_cast<uint32_t>(kGen5PartyMonSize);
+		if (!IsValidGen5StoredPartyPokemon(monAddr)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool IsValidatedBw2SaveRuntimeRoot(uint32_t partyAddr)
+{
+	if (!IsValidatedBw2PartyRuntimeRoot(partyAddr, false) ||
+	    partyAddr < (kArm9MainRamStart + 0x18A08u + 0x3E0u)) {
+		return false;
+	}
+
+	const uint32_t partyObjectAddr = partyAddr - 0x8u;
+	const uint32_t boxBaseAddr = partyObjectAddr - 0x18A00u;
+	const uint32_t currentBoxIndexAddr = boxBaseAddr - 0x3E0u;
+	return ReadArm9U8(currentBoxIndexAddr) < kBwExportBoxCount;
+}
+
+static bool TryDiscoverBw2PartyRuntimeRoot(
+	uint32_t expectedPartyAddr,
+	uint32_t &partyAddrOut)
+{
+	// The canonical address remains useful before a save is loaded, when an
+	// empty party is legitimate. Relocated candidates must contain at least one
+	// checksum-valid Pokemon so an unrelated { max=6, count<=6 } pair cannot be
+	// mistaken for the save-data party object.
+	const bool canonicalEmptyParty =
+		IsValidatedBw2PartyRuntimeRoot(expectedPartyAddr, true) &&
+		ReadArm9U32(expectedPartyAddr - 0x4u) == 0u;
+	if (IsValidatedBw2PartyRuntimeRoot(expectedPartyAddr, false)) {
+		partyAddrOut = expectedPartyAddr;
+		return true;
+	}
+
+	static std::mutex cacheMutex;
+	static std::map<uint32_t, uint32_t> cachedPartyRoots;
+	uint32_t cachedPartyAddr = 0u;
+	{
+		std::lock_guard<std::mutex> lock(cacheMutex);
+		const std::map<uint32_t, uint32_t>::const_iterator cached =
+			cachedPartyRoots.find(expectedPartyAddr);
+		if (cached != cachedPartyRoots.end()) {
+			cachedPartyAddr = cached->second;
+		}
+	}
+	if (cachedPartyAddr != 0u &&
+	    IsValidatedBw2SaveRuntimeRoot(cachedPartyAddr)) {
+		partyAddrOut = cachedPartyAddr;
+		return true;
+	}
+
+	for (uint32_t distance = 4u; distance <= kBw2RuntimePartyRootScanRadius; distance += 4u) {
+		const uint32_t higher = expectedPartyAddr + distance;
+		if (higher > expectedPartyAddr &&
+		    IsValidatedBw2SaveRuntimeRoot(higher)) {
+			partyAddrOut = higher;
+			std::lock_guard<std::mutex> lock(cacheMutex);
+			cachedPartyRoots[expectedPartyAddr] = higher;
+			return true;
+		}
+
+		if (expectedPartyAddr >= distance) {
+			const uint32_t lower = expectedPartyAddr - distance;
+			if (IsValidatedBw2SaveRuntimeRoot(lower)) {
+				partyAddrOut = lower;
+				std::lock_guard<std::mutex> lock(cacheMutex);
+				cachedPartyRoots[expectedPartyAddr] = lower;
+				return true;
+			}
+		}
+	}
+
+	if (canonicalEmptyParty) {
+		partyAddrOut = expectedPartyAddr;
+		return true;
+	}
+
+	return false;
+}
+
 static bool TryResolveBwRuntimeAddresses(const std::string &gameCode, PokemonRuntimeAddresses &addressesOut, std::string &errorOut)
 {
 	struct BwBaseRoots {
@@ -1251,11 +1427,26 @@ static bool TryResolveBwRuntimeAddresses(const std::string &gameCode, PokemonRun
 	}
 
 	const uint32_t whiteDelta = (versionCode == 'A' && languageCode != 'K') ? 0x20u : 0u;
-	addressesOut.partyCountAddr = baseRoots->partyCountAddr + whiteDelta;
-	addressesOut.partyBaseAddr = baseRoots->partyAddr + whiteDelta;
-	addressesOut.currentBoxIndexAddr = baseRoots->currentBoxIndexAddr + whiteDelta;
-	addressesOut.boxBaseAddr = baseRoots->boxAddr + whiteDelta;
-	addressesOut.trainerIdsAddr = baseRoots->trainerIdsAddr + whiteDelta;
+	uint32_t runtimeDelta = whiteDelta;
+
+	// Brutal Black retains IRBO, so the ROM header alone cannot distinguish it
+	// from vanilla US Black. Its live save-data roots are relocated by +0x40.
+	// Prefer the canonical roots whenever their party header is valid, then
+	// probe the known relocation so vanilla BW behavior remains unchanged.
+	const uint32_t canonicalPartyCountAddr = baseRoots->partyCountAddr + runtimeDelta;
+	const uint32_t canonicalPartyAddr = baseRoots->partyAddr + runtimeDelta;
+	if (!IsPlausibleBwPartyRuntimeRoot(canonicalPartyCountAddr, canonicalPartyAddr) &&
+	    IsPlausibleBwPartyRuntimeRoot(
+		    canonicalPartyCountAddr + kBwBrutalBlackRuntimeRootDelta,
+		    canonicalPartyAddr + kBwBrutalBlackRuntimeRootDelta)) {
+		runtimeDelta += kBwBrutalBlackRuntimeRootDelta;
+	}
+
+	addressesOut.partyCountAddr = baseRoots->partyCountAddr + runtimeDelta;
+	addressesOut.partyBaseAddr = baseRoots->partyAddr + runtimeDelta;
+	addressesOut.currentBoxIndexAddr = baseRoots->currentBoxIndexAddr + runtimeDelta;
+	addressesOut.boxBaseAddr = baseRoots->boxAddr + runtimeDelta;
+	addressesOut.trainerIdsAddr = baseRoots->trainerIdsAddr + runtimeDelta;
 	addressesOut.language.assign(baseRoots->languageName);
 	return true;
 }
@@ -1290,16 +1481,28 @@ static bool TryResolveBw2RuntimeAddressesFromRoots(
 		return false;
 	}
 
-	const uint32_t partyObjectAddr = baseRoots->partyAddr - 0x8u;
-	addressesOut.partyCountAddr = baseRoots->partyAddr - 0x4u;
-	addressesOut.partyBaseAddr = baseRoots->partyAddr;
+	uint32_t resolvedPartyAddr = 0u;
+	if (!TryDiscoverBw2PartyRuntimeRoot(baseRoots->partyAddr, resolvedPartyAddr)) {
+		errorOut = std::string("Could not locate the live ") + profileName
+			+ " party storage root";
+		return false;
+	}
+
+	const int32_t runtimeDelta = static_cast<int32_t>(
+		resolvedPartyAddr - baseRoots->partyAddr);
+	const uint32_t battleWorkRootAddr = (baseRoots->battleWorkRootAddr != 0u)
+		? static_cast<uint32_t>(baseRoots->battleWorkRootAddr + runtimeDelta)
+		: 0u;
+	const uint32_t partyObjectAddr = resolvedPartyAddr - 0x8u;
+	addressesOut.partyCountAddr = resolvedPartyAddr - 0x4u;
+	addressesOut.partyBaseAddr = resolvedPartyAddr;
 	addressesOut.boxBaseAddr = partyObjectAddr - 0x18A00u;
 	addressesOut.currentBoxIndexAddr = addressesOut.boxBaseAddr - 0x3E0u;
-	addressesOut.currentBoxIndexFallbackAddr = (baseRoots->battleWorkRootAddr != 0u)
-		? (baseRoots->battleWorkRootAddr + 0xF9A8u)
+	addressesOut.currentBoxIndexFallbackAddr = (battleWorkRootAddr != 0u)
+		? (battleWorkRootAddr + 0xF9A8u)
 		: 0u;
-	addressesOut.bwBattleMainAddr = (baseRoots->battleWorkRootAddr != 0u)
-		? (baseRoots->battleWorkRootAddr + kBw2BattleMainModuleOffsetFromBattleWorkRoot)
+	addressesOut.bwBattleMainAddr = (battleWorkRootAddr != 0u)
+		? (battleWorkRootAddr + kBw2BattleMainModuleOffsetFromBattleWorkRoot)
 		: 0u;
 	addressesOut.trainerIdsAddr = partyObjectAddr + 0x614u;
 	addressesOut.language.assign(baseRoots->languageName);
@@ -2888,6 +3091,10 @@ static uint32_t GetLiveExportBoxCount(const PokemonMemoryLayout *layout)
 		return std::min<uint32_t>(static_cast<uint32_t>(kGen4LiveExportBoxCount), static_cast<uint32_t>(layout->exportBoxCount));
 	}
 
+	if (layout == &kGen5BwPokemonLayout) {
+		return std::min<uint32_t>(static_cast<uint32_t>(kBwLiveExportBoxCount), static_cast<uint32_t>(layout->exportBoxCount));
+	}
+
 	return static_cast<uint32_t>(layout->exportBoxCount - 1u);
 }
 
@@ -2973,7 +3180,7 @@ static const ExportProfileDefinition *GetExportProfileDefinition(ExportGameProfi
 				"Platinum Kaizo",
 				"Platinum Kaizo",
 				&kPlatinumKaizoTextTables,
-				&kGen4Mechanics,
+				&kPlatinumKaizoMechanics,
 				&kGen4PokemonLayout,
 				&kGen4BattleLayout
 			};
@@ -3009,7 +3216,7 @@ static const ExportProfileDefinition *GetExportProfileDefinition(ExportGameProfi
 				"Sterling Silver",
 				"Sterling Silver",
 				&kSterlingSilverTextTables,
-				&kGen4Mechanics,
+				&kSterlingSilverMechanics,
 				&kHgssPokemonLayout,
 				&kHgssBattleLayout
 			};
@@ -3057,7 +3264,7 @@ static const ExportProfileDefinition *GetExportProfileDefinition(ExportGameProfi
 				"Blaze Black 2 Redux/Volt White 2 Redux",
 				"Blaze Black 2 Redux/Volt White 2 Redux",
 				&kBb2Vw2ReduxTextTables,
-				&kGen5Mechanics,
+				&kBb2Vw2ReduxMechanics,
 				&kGen5BwPokemonLayout,
 				&kBwBattleLayout
 			};
@@ -4156,15 +4363,23 @@ static const char *GetGen5FormSuffixAdapter(uint16_t speciesId, uint8_t formInde
 	return desmume_pokemon_gen5::GetFormSuffix(speciesId, formIndex);
 }
 
-static int GetLevelForExperienceGen4(uint32_t experience, int speciesId)
+static int GetLevelForExperienceGen4WithGrowthCurves(
+	uint32_t experience,
+	int speciesId,
+	const uint8_t *growthCurves,
+	size_t growthCurvesCount)
 {
 	using namespace desmume_pokemon_gen4;
 
-	if (speciesId <= 0 || static_cast<size_t>(speciesId) > kGrowthCurvesCount) {
+	if (speciesId <= 0 || static_cast<size_t>(speciesId) > growthCurvesCount) {
 		return 0;
 	}
 
-	const uint8_t curve = kGrowthCurves[speciesId - 1];
+	const uint8_t curve = growthCurves[speciesId - 1];
+	if (curve >= 6) {
+		return 0;
+	}
+
 	for (int level = 100; level >= 1; --level) {
 		if (experience >= kLevelExpCurve[level - 1][curve]) {
 			return level;
@@ -4174,7 +4389,11 @@ static int GetLevelForExperienceGen4(uint32_t experience, int speciesId)
 	return 0;
 }
 
-static uint32_t GetExperienceForLevelGen4(int level, int speciesId)
+static uint32_t GetExperienceForLevelGen4WithGrowthCurves(
+	int level,
+	int speciesId,
+	const uint8_t *growthCurves,
+	size_t growthCurvesCount)
 {
 	using namespace desmume_pokemon_gen4;
 
@@ -4184,48 +4403,158 @@ static uint32_t GetExperienceForLevelGen4(int level, int speciesId)
 		level = 100;
 	}
 
-	if (speciesId <= 0 || static_cast<size_t>(speciesId) > kGrowthCurvesCount) {
+	if (speciesId <= 0 || static_cast<size_t>(speciesId) > growthCurvesCount) {
 		return 0;
 	}
 
-	const uint8_t curve = kGrowthCurves[speciesId - 1];
+	const uint8_t curve = growthCurves[speciesId - 1];
+	if (curve >= 6) {
+		return 0;
+	}
+
+	return kLevelExpCurve[level - 1][curve];
+}
+
+static int GetLevelForExperienceGen4(uint32_t experience, int speciesId)
+{
+	return GetLevelForExperienceGen4WithGrowthCurves(
+		experience,
+		speciesId,
+		desmume_pokemon_gen4::kGrowthCurves,
+		desmume_pokemon_gen4::kGrowthCurvesCount);
+}
+
+static uint32_t GetExperienceForLevelGen4(int level, int speciesId)
+{
+	return GetExperienceForLevelGen4WithGrowthCurves(
+		level,
+		speciesId,
+		desmume_pokemon_gen4::kGrowthCurves,
+		desmume_pokemon_gen4::kGrowthCurvesCount);
+}
+
+static int GetLevelForExperiencePlatinumKaizo(uint32_t experience, int speciesId)
+{
+	return GetLevelForExperienceGen4WithGrowthCurves(
+		experience,
+		speciesId,
+		desmume_pokemon_gen4_platinum_kaizo::kGrowthCurves,
+		desmume_pokemon_gen4_platinum_kaizo::kGrowthCurvesCount);
+}
+
+static uint32_t GetExperienceForLevelPlatinumKaizo(int level, int speciesId)
+{
+	return GetExperienceForLevelGen4WithGrowthCurves(
+		level,
+		speciesId,
+		desmume_pokemon_gen4_platinum_kaizo::kGrowthCurves,
+		desmume_pokemon_gen4_platinum_kaizo::kGrowthCurvesCount);
+}
+
+static int GetLevelForExperienceSterlingSilver(uint32_t experience, int speciesId)
+{
+	return GetLevelForExperienceGen4WithGrowthCurves(
+		experience,
+		speciesId,
+		desmume_pokemon_gen4_sterling_silver::kGrowthCurves,
+		desmume_pokemon_gen4_sterling_silver::kGrowthCurvesCount);
+}
+
+static uint32_t GetExperienceForLevelSterlingSilver(int level, int speciesId)
+{
+	return GetExperienceForLevelGen4WithGrowthCurves(
+		level,
+		speciesId,
+		desmume_pokemon_gen4_sterling_silver::kGrowthCurves,
+		desmume_pokemon_gen4_sterling_silver::kGrowthCurvesCount);
+}
+
+static int GetLevelForExperienceGen5WithGrowthCurves(
+	uint32_t experience,
+	int speciesId,
+	const uint8_t *growthCurves,
+	size_t growthCurvesCount)
+{
+	using namespace desmume_pokemon_gen5;
+
+	if (speciesId <= 0 || static_cast<size_t>(speciesId) > growthCurvesCount) {
+		return 0;
+	}
+
+	const uint8_t curve = growthCurves[speciesId - 1];
+	if (curve >= 6) {
+		return 0;
+	}
+
+	for (int level = 100; level >= 1; --level) {
+		if (experience >= kLevelExpCurve[level - 1][curve]) {
+			return level;
+		}
+	}
+
+	return 0;
+}
+
+static uint32_t GetExperienceForLevelGen5WithGrowthCurves(
+	int level,
+	int speciesId,
+	const uint8_t *growthCurves,
+	size_t growthCurvesCount)
+{
+	using namespace desmume_pokemon_gen5;
+
+	if (level < 1) {
+		level = 1;
+	} else if (level > 100) {
+		level = 100;
+	}
+
+	if (speciesId <= 0 || static_cast<size_t>(speciesId) > growthCurvesCount) {
+		return 0;
+	}
+
+	const uint8_t curve = growthCurves[speciesId - 1];
+	if (curve >= 6) {
+		return 0;
+	}
+
 	return kLevelExpCurve[level - 1][curve];
 }
 
 static int GetLevelForExperienceGen5(uint32_t experience, int speciesId)
 {
-	using namespace desmume_pokemon_gen5;
-
-	if (speciesId <= 0 || static_cast<size_t>(speciesId) > kGrowthCurvesCount) {
-		return 0;
-	}
-
-	const uint8_t curve = kGrowthCurves[speciesId - 1];
-	for (int level = 100; level >= 1; --level) {
-		if (experience >= kLevelExpCurve[level - 1][curve]) {
-			return level;
-		}
-	}
-
-	return 0;
+	return GetLevelForExperienceGen5WithGrowthCurves(
+		experience,
+		speciesId,
+		desmume_pokemon_gen5::kGrowthCurves,
+		desmume_pokemon_gen5::kGrowthCurvesCount);
 }
 
 static uint32_t GetExperienceForLevelGen5(int level, int speciesId)
 {
-	using namespace desmume_pokemon_gen5;
+	return GetExperienceForLevelGen5WithGrowthCurves(
+		level,
+		speciesId,
+		desmume_pokemon_gen5::kGrowthCurves,
+		desmume_pokemon_gen5::kGrowthCurvesCount);
+}
 
-	if (level < 1) {
-		level = 1;
-	} else if (level > 100) {
-		level = 100;
-	}
+static int GetLevelForExperienceBb2Vw2Redux(uint32_t experience, int speciesId)
+{
+	return GetLevelForExperienceGen5WithGrowthCurves(
+		experience,
+		speciesId,
+		desmume_pokemon_gen5_bb2_vw2_redux::kGrowthCurves,
+		desmume_pokemon_gen5_bb2_vw2_redux::kGrowthCurvesCount);
+}
 
-	if (speciesId <= 0 || static_cast<size_t>(speciesId) > kGrowthCurvesCount) {
-		return 0;
-	}
-
-	const uint8_t curve = kGrowthCurves[speciesId - 1];
-	return kLevelExpCurve[level - 1][curve];
+static uint32_t GetExperienceForLevelBb2Vw2Redux(int level, int speciesId)
+{
+	return GetExperienceForLevelGen5WithGrowthCurves(
+		level,
+		speciesId,
+		desmume_pokemon_gen5_bb2_vw2_redux::kGrowthCurves,
+		desmume_pokemon_gen5_bb2_vw2_redux::kGrowthCurvesCount);
 }
 
 static std::string NormalizeMoveName(const std::string &name)
@@ -10493,6 +10822,14 @@ static void AppendU16LE(std::string &out, uint16_t value)
 	out.push_back(static_cast<char>((value >> 8) & 0xFFu));
 }
 
+static void AppendU32LE(std::string &out, uint32_t value)
+{
+	out.push_back(static_cast<char>(value & 0xFFu));
+	out.push_back(static_cast<char>((value >> 8) & 0xFFu));
+	out.push_back(static_cast<char>((value >> 16) & 0xFFu));
+	out.push_back(static_cast<char>((value >> 24) & 0xFFu));
+}
+
 static void AppendZeroBytes(std::string &out, size_t count)
 {
 	out.append(count, '\0');
@@ -10815,6 +11152,43 @@ static void AppendZeroBytes(std::string &out, size_t count)
 		const uint32_t boxBaseAddr = addresses.boxBaseAddr;
 		std::vector<PackedDeadMonRecord> deadRecords;
 		deadRecords.reserve(static_cast<size_t>(deadBoxCount) * layout->partySlotsPerBox);
+		struct SaveBattleLogRange {
+			uint32_t offset;
+			uint32_t size;
+		};
+		std::vector<u8> rawSaveData;
+		std::vector<SaveBattleLogRange> saveBattleLogRanges;
+		uint8_t saveBattleLogBaseVersion = 0u;
+		if (IsGen5BwLikePokemonProfile(selectedProfile) && MMU_new.backupDevice.copyRawData(rawSaveData)) {
+			static const SaveBattleLogRange kBaseRanges[] = {
+				{0x19600u, 0x1338u},
+				{0x1AA00u, 0x07C4u},
+				{0x1B200u, 0x0D54u}
+			};
+			const uint32_t secondCopyOffset = (selectedProfile == EXPORT_GAME_POKEMON_BLACK_WHITE)
+				? 0x24000u
+				: 0x26000u;
+			saveBattleLogBaseVersion = (selectedProfile == EXPORT_GAME_POKEMON_BLACK_WHITE) ? 1u : 2u;
+			for (size_t copyIndex = 0; copyIndex < 2u; ++copyIndex) {
+				const uint32_t copyOffset = (copyIndex == 0u) ? 0u : secondCopyOffset;
+				for (size_t rangeIndex = 0; rangeIndex < (sizeof(kBaseRanges) / sizeof(kBaseRanges[0])); ++rangeIndex) {
+					SaveBattleLogRange range = kBaseRanges[rangeIndex];
+					range.offset += copyOffset;
+					if (range.offset > rawSaveData.size() || range.size > (rawSaveData.size() - range.offset)) {
+						saveBattleLogRanges.clear();
+						break;
+					}
+					saveBattleLogRanges.push_back(range);
+				}
+				if (saveBattleLogRanges.empty()) {
+					break;
+				}
+			}
+			if (saveBattleLogRanges.size() != 6u) {
+				saveBattleLogRanges.clear();
+				saveBattleLogBaseVersion = 0u;
+			}
+		}
 
 		for (uint32_t box = 0; box < deadBoxCount; ++box) {
 			const uint32_t actualBoxIndex = deadBoxStartIndex + box;
@@ -10866,7 +11240,7 @@ static void AppendZeroBytes(std::string &out, size_t count)
 
 		std::string payload;
 		payload.reserve(18 + (static_cast<size_t>(partyCount) * layout->partyMonSize) + (static_cast<size_t>(boxSlotsDumped) * layout->boxMonSize) + (deadRecords.size() * 6u));
-		payload += "DPB2";
+		payload += saveBattleLogRanges.empty() ? "DPB2" : "DPB3";
 		AppendU16LE(payload, trainerId);
 		AppendU16LE(payload, secretId);
 		payload.push_back(static_cast<char>(partyCount));
@@ -10932,6 +11306,20 @@ static void AppendZeroBytes(std::string &out, size_t count)
 			payload.push_back(static_cast<char>(deadRecords[i].slot));
 			AppendU16LE(payload, deadRecords[i].speciesId);
 			AppendU16LE(payload, deadRecords[i].metLocationId);
+		}
+		if (!saveBattleLogRanges.empty()) {
+			payload += "GBL1";
+			payload.push_back(static_cast<char>(saveBattleLogBaseVersion));
+			payload.push_back(static_cast<char>(saveBattleLogRanges.size()));
+			AppendU16LE(payload, 0u);
+			for (size_t i = 0; i < saveBattleLogRanges.size(); ++i) {
+				const SaveBattleLogRange &range = saveBattleLogRanges[i];
+				AppendU32LE(payload, range.offset);
+				AppendU32LE(payload, range.size);
+				payload.append(
+					reinterpret_cast<const char *>(&rawSaveData[range.offset]),
+					static_cast<size_t>(range.size));
+			}
 		}
 
 		snapshot.success = true;

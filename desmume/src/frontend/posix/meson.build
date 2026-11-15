@@ -283,13 +283,16 @@ if dep_soundtouch.found()
 endif
 
 if dep_agg.found()
-  dependencies += dep_agg
   add_global_arguments('-DHAVE_LIBAGG', language: ['c', 'cpp'])
   if dep_fontconfig.found()
-    dependencies += dep_fontconfig
-    add_global_arguments('-DAGG2D_USE_VECTORFONTS', language: ['c', 'cpp'])
-    add_global_link_arguments('-laggfontfreetype', language: ['c', 'cpp'])
+    cpp = meson.get_compiler('cpp')
+    dep_agg_font_freetype = cpp.find_library('aggfontfreetype', required: false)
+    if cpp.has_header('agg_font_freetype.h', dependencies: dep_agg) and dep_agg_font_freetype.found()
+      dependencies += [dep_fontconfig, dep_agg_font_freetype]
+      add_global_arguments('-DAGG2D_USE_VECTORFONTS', language: ['c', 'cpp'])
+    endif
   endif
+  dependencies += dep_agg
   libdesmume_src += [
     '../modules/osd/agg/aggdraw.cpp',
     '../modules/osd/agg/agg_osd.cpp',
